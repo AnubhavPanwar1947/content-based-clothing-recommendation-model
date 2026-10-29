@@ -4,3 +4,6 @@ scikit-learn
 jupyter
 joblib
 ipykernel
+fastapi
+uvicorn
+pydantic
