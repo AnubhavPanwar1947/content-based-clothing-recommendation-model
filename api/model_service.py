@@ -15,7 +15,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_PATH = PROJECT_ROOT / "data" / "products.json"
 
-with DATA_PATH.open("r", encoding="utf-8") as file:
+with DATA_PATH.open("r", encoding="utf-8-sig") as file:
     products = json.load(file)
 
 products_df = pd.DataFrame(products)
@@ -273,14 +273,329 @@ def extract_query_features(query):
 
 
 # -----------------------------
+# Catalog filters, sort, pagination
+# -----------------------------
+
+SEARCH_RESULT_COLUMNS = [
+    "id",
+    "name",
+    "imageUrl",
+    "category",
+    "gender",
+    "colors",
+    "style",
+    "material",
+    "season",
+    "price",
+    "rating",
+    "popularity",
+    "sizes",
+    "stock",
+    "search_score",
+    "match_type",
+]
+
+
+def _normalize_optional_text(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    return text
+
+
+def _stock_status_mask(stock_series, stock_filter):
+    if not stock_filter:
+        return pd.Series(True, index=stock_series.index)
+
+    stock_values = pd.to_numeric(
+        stock_series,
+        errors="coerce",
+    ).fillna(0)
+
+    stock_filter = str(stock_filter).casefold().strip()
+
+    if stock_filter == "in":
+        return stock_values.gt(5)
+
+    if stock_filter == "low":
+        return stock_values.gt(0) & stock_values.le(5)
+
+    if stock_filter == "out":
+        return stock_values.le(0)
+
+    return pd.Series(True, index=stock_series.index)
+
+
+def _row_contains_value(values, requested_value):
+    requested = str(requested_value).casefold().strip()
+
+    if not requested:
+        return True
+
+    if not isinstance(values, list):
+        values = [values]
+
+    actual_values = {
+        str(value).casefold().strip()
+        for value in values
+    }
+
+    return requested in actual_values
+
+
+def apply_request_filters(
+    frame,
+    gender=None,
+    include_unisex=True,
+    category=None,
+    size=None,
+    color=None,
+    price_min=None,
+    price_max=None,
+    stock=None,
+):
+    if frame.empty:
+        return frame
+
+    filtered = frame.copy()
+    category_filter = _normalize_optional_text(category)
+
+    if category_filter:
+        category_values = (
+            filtered["category"]
+            .astype(str)
+            .str.casefold()
+            .str.strip()
+        )
+        filtered = filtered[
+            category_values == category_filter.casefold()
+        ]
+
+    gender_filter = _normalize_optional_text(gender)
+
+    if gender_filter:
+        gender_values = (
+            filtered["gender"]
+            .astype(str)
+            .str.casefold()
+            .str.strip()
+        )
+        allowed_genders = {gender_filter.casefold()}
+
+        if include_unisex and gender_filter.casefold() in {
+            "men",
+            "women",
+        }:
+            allowed_genders.add("unisex")
+
+        filtered = filtered[
+            gender_values.isin(allowed_genders)
+        ]
+
+    size_filter = _normalize_optional_text(size)
+
+    if size_filter:
+        filtered = filtered[
+            filtered["sizes"].apply(
+                lambda values: _row_contains_value(
+                    values,
+                    size_filter,
+                )
+            )
+        ]
+
+    color_filter = _normalize_optional_text(color)
+
+    if color_filter:
+        filtered = filtered[
+            filtered["colors"].apply(
+                lambda values: _row_contains_value(
+                    values,
+                    color_filter,
+                )
+            )
+        ]
+
+    if price_min is not None:
+        filtered = filtered[
+            filtered["price"].fillna(np.inf).ge(price_min)
+        ]
+
+    if price_max is not None:
+        filtered = filtered[
+            filtered["price"].fillna(np.inf).le(price_max)
+        ]
+
+    stock_filter = _normalize_optional_text(stock)
+
+    if stock_filter:
+        filtered = filtered[
+            _stock_status_mask(
+                filtered["stock"],
+                stock_filter,
+            )
+        ]
+
+    return filtered
+
+
+def sort_product_frame(frame, sort="recommended"):
+    if frame.empty:
+        return frame
+
+    sorted_frame = frame.copy()
+    sort = str(sort or "recommended").casefold()
+
+    if sort == "price-asc":
+        return sorted_frame.sort_values(
+            ["price", "id"],
+            ascending=[True, True],
+        )
+
+    if sort == "price-desc":
+        return sorted_frame.sort_values(
+            ["price", "id"],
+            ascending=[False, True],
+        )
+
+    if sort == "rating":
+        return sorted_frame.sort_values(
+            ["rating", "popularity", "id"],
+            ascending=[False, False, True],
+            na_position="last",
+        )
+
+    if sort == "newest":
+        return sorted_frame.sort_values(
+            ["id"],
+            ascending=[False],
+        )
+
+    if "search_score" in sorted_frame.columns:
+        return sorted_frame.sort_values(
+            ["search_score", "popularity", "id"],
+            ascending=[False, False, True],
+        )
+
+    return sorted_frame.sort_values(
+        ["popularity", "rating", "id"],
+        ascending=[False, False, True],
+        na_position="last",
+    )
+
+
+def paginate_product_frame(frame, limit, offset):
+    limit = int(limit)
+    offset = int(offset)
+
+    if limit <= 0:
+        return frame.iloc[0:0].copy(), len(frame)
+
+    total = len(frame)
+    page = frame.iloc[offset: offset + limit].copy()
+
+    return page, total
+
+
+def get_catalog_filter_options():
+    categories = sorted(
+        {
+            str(value).strip()
+            for value in products_df["category"].dropna()
+            if str(value).strip()
+        }
+    )
+    genders = sorted(
+        {
+            str(value).strip()
+            for value in products_df["gender"].dropna()
+            if str(value).strip()
+        }
+    )
+
+    sizes = set()
+    colors = set()
+
+    for values in products_df["sizes"].dropna():
+        if isinstance(values, list):
+            sizes.update(
+                str(item).strip()
+                for item in values
+                if str(item).strip()
+            )
+
+    for values in products_df["colors"].dropna():
+        if isinstance(values, list):
+            colors.update(
+                str(item).strip()
+                for item in values
+                if str(item).strip()
+            )
+
+    return {
+        "categories": categories,
+        "genders": genders,
+        "sizes": sorted(sizes),
+        "colors": sorted(colors),
+    }
+
+
+def list_catalog_products(
+    limit=24,
+    offset=0,
+    gender=None,
+    include_unisex=True,
+    category=None,
+    size=None,
+    color=None,
+    price_min=None,
+    price_max=None,
+    stock=None,
+    sort="recommended",
+):
+    filtered = apply_request_filters(
+        products_df,
+        gender=gender,
+        include_unisex=include_unisex,
+        category=category,
+        size=size,
+        color=color,
+        price_min=price_min,
+        price_max=price_max,
+        stock=stock,
+    )
+    sorted_frame = sort_product_frame(filtered, sort=sort)
+    page, total = paginate_product_frame(
+        sorted_frame,
+        limit,
+        offset,
+    )
+
+    return page, total
+
+
+# -----------------------------
 # Search function
 # -----------------------------
 
 def search_products(
     query,
-    n=50,
+    limit=24,
+    offset=0,
     gender=None,
     include_unisex=True,
+    category=None,
+    size=None,
+    color=None,
+    price_min=None,
+    price_max=None,
+    stock=None,
+    sort="recommended",
 ):
     if search_matrix.shape[0] != len(products_df):
         raise RuntimeError(
@@ -288,10 +603,8 @@ def search_products(
             "Restart the model and rebuild the data."
         )
 
-    n = int(n)
-
-    if n <= 0:
-        return pd.DataFrame()
+    if limit <= 0:
+        return pd.DataFrame(), 0
 
     features = extract_query_features(query)
     normalized_query = features["normalized_query"]
@@ -407,7 +720,7 @@ def search_products(
             ).le(features["max_price"])
 
     if not candidate_mask.any():
-        return pd.DataFrame()
+        return pd.DataFrame(), 0
 
     results = products_df.loc[candidate_mask].copy()
 
@@ -417,25 +730,36 @@ def search_products(
 
     results["match_type"] = match_type
 
-    results = results.sort_values(
-        ["search_score", "popularity"],
-        ascending=[False, False],
+    results = apply_request_filters(
+        results,
+        gender=gender,
+        include_unisex=include_unisex,
+        category=category,
+        size=size,
+        color=color,
+        price_min=price_min,
+        price_max=price_max,
+        stock=stock,
     )
 
-    return results[
-        [
-            "id",
-            "name",
-            "category",
-            "gender",
-            "colors",
-            "style",
-            "price",
-            "stock",
-            "search_score",
-            "match_type",
-        ]
-    ].head(n).reset_index(drop=True)
+    if sort == "recommended":
+        results = sort_product_frame(results, sort="recommended")
+    else:
+        results = sort_product_frame(results, sort=sort)
+
+    page, total = paginate_product_frame(
+        results,
+        limit,
+        offset,
+    )
+
+    available_columns = [
+        column
+        for column in SEARCH_RESULT_COLUMNS
+        if column in page.columns
+    ]
+
+    return page[available_columns].reset_index(drop=True), total
 
 
 # -----------------------------
@@ -564,6 +888,7 @@ def recommend_products(
         [
             "id",
             "name",
+            "imageUrl",
             "category",
             "gender",
             "colors",
